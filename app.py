@@ -7,9 +7,13 @@ Run:  streamlit run app.py
 """
 import ast
 import html
+import json
 import os
 import random
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import joblib
@@ -18,6 +22,7 @@ import pandas as pd
 import streamlit as st
 from sklearn.metrics.pairwise import cosine_similarity
 
+
 DATA_DIR = Path(os.environ.get("MOVIE_DATA_DIR", Path(__file__).parent))
 POSTER_HOSTS = [
     "https://image.tmdb.org/t/p/w342",
@@ -25,6 +30,8 @@ POSTER_HOSTS = [
     # Public image proxy: fetches the TMDB image for you, helps when TMDB itself is blocked
     "https://wsrv.nl/?url=image.tmdb.org/t/p/w342",
 ]
+
+UA = "CineMind-AI/1.0"
 
 st.set_page_config(page_title="CineMind-AI", page_icon="🎬", layout="wide")
 
@@ -43,8 +50,10 @@ st.markdown(
 [data-testid="stHeader"] { background: transparent; }
 #MainMenu, footer { visibility: hidden; }
 .block-container { padding-top: 2rem; max-width: 1400px; }
-.stButton > button { background: var(--red); color: #fff; border: 0; font-weight: 700; border-radius: 4px; }
-.stButton > button:hover { background: #f6121d; color: #fff; }
+.stButton > button { background: #1f1f1f; color: #fff; border: 1px solid #333; border-radius: 4px; text-align: left; }
+.stButton > button:hover { border-color: var(--red); color: #fff; }
+.stButton > button[kind="primary"], .stButton > button[data-testid="stBaseButton-primary"] { background: var(--red); border: 0; font-weight: 700; text-align: center; }
+.stButton > button[kind="primary"]:hover, .stButton > button[data-testid="stBaseButton-primary"]:hover { background: #f6121d; }
 h2, h3, .display { font-family: 'Bebas Neue', sans-serif !important; letter-spacing: .03em; font-weight: 400 !important; }
 
 .brand { font-family: 'Bebas Neue', sans-serif; color: var(--red); font-size: 2.6rem; letter-spacing: .05em; line-height: 1; margin-bottom: 1rem; }
@@ -86,6 +95,10 @@ h2, h3, .display { font-family: 'Bebas Neue', sans-serif !important; letter-spac
 .chips { display: flex; flex-wrap: wrap; gap: 5px; }
 .chip { font-size: .7rem; padding: 2px 8px; border-radius: 3px; background: #2f2f2f; color: var(--muted); }
 .chip.shared { background: rgba(229,9,20,.18); color: #ff6b73; }
+.field-label { font-size: .875rem; color: #fff; margin: 0 0 .4rem; }
+.now { margin: .8rem 0 1rem; padding: .6rem .8rem; border-left: 3px solid var(--red); background: #161616; border-radius: 4px; }
+.now small { display: block; color: var(--muted); font-size: .68rem; letter-spacing: .08em; text-transform: uppercase; }
+.now span { font-weight: 600; font-size: .92rem; line-height: 1.3; }
 @media (max-width: 700px) { .hero-in { flex-direction: column; } .hero h2 { font-size: 2.6rem; } }
 </style>
 """,
@@ -206,7 +219,6 @@ def recommend(movies, tfidf, idx, n, min_rating, genres, sort_by):
 @st.cache_data(ttl=120, show_spinner=False)
 def pick_poster_host(paths):
     """Return the first poster server that serves any of the sample posters, else None."""
-    import requests
     from concurrent.futures import ThreadPoolExecutor
 
     if not paths:
@@ -214,9 +226,9 @@ def pick_poster_host(paths):
 
     def ok(url):
         try:
-            r = requests.get(url, timeout=4, stream=True)
-            r.close()
-            return r.status_code == 200
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=4) as r:
+                return r.status == 200
         except Exception:
             return False
 
@@ -243,21 +255,26 @@ def poster_cache():
 
 def fetch_fresh_paths(rows, key, cache):
     """Ask TMDB for the current poster path of each movie. Returns a list of failure codes."""
-    import requests
     from concurrent.futures import ThreadPoolExecutor
 
-    headers = {"Authorization": f"Bearer {key}"} if key.startswith("eyJ") else {}
-    params = {} if headers else {"api_key": key}
+    bearer = key.startswith("eyJ")  # long "Read Access Token" instead of the short API key
     todo = sorted({int(r["tmdb_id"]) for _, r in rows if pd.notna(r["tmdb_id"]) and int(r["tmdb_id"]) not in cache})
 
     def get(i):
+        url = f"https://api.themoviedb.org/3/movie/{i}"
+        headers = {"User-Agent": UA}
+        if bearer:
+            headers["Authorization"] = f"Bearer {key}"
+        else:
+            url += "?" + urllib.parse.urlencode({"api_key": key})
         code = 0
         for attempt in range(3):  # retry timeouts, rate limits and server errors
             try:
-                r = requests.get(f"https://api.themoviedb.org/3/movie/{i}", params=params, headers=headers, timeout=8)
-                code = r.status_code
-                if code == 200:
-                    return i, (r.json().get("poster_path") or ""), 200
+                with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=8) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+                    return i, (data.get("poster_path") or ""), 200
+            except urllib.error.HTTPError as e:
+                code = e.code
                 if code == 404:
                     return i, "", 404
                 if code in (401, 403):
@@ -346,7 +363,11 @@ except Exception as e:  # missing files, version mismatch, failed row match
     st.error(f"Could not load the model files from {DATA_DIR}.\n\n{e}")
     st.stop()
 
-labels = movies.sort_values("popularity", ascending=False)["label"].tolist()
+# The dropdown lists only the best-known movies: sending all 45,000 to the browser makes it hang.
+# Recommendations still search every movie in the model.
+MENU_SIZE = 4000
+menu = movies.sort_values(["vote_count", "popularity"], ascending=False).head(MENU_SIZE)
+labels = menu.sort_values("popularity", ascending=False)["label"].tolist()
 label_to_idx = dict(zip(movies["label"], movies.index))
 all_genres = sorted({g for gl in movies["genre_list"] for g in gl})
 
@@ -354,14 +375,54 @@ if "pick" not in st.session_state:
     st.session_state["pick"] = labels[0]
 
 
+@st.cache_resource
+def search_index(_movies):
+    """All movie labels, most popular first, plus a lowercase copy for fast matching."""
+    labs = _movies.sort_values("popularity", ascending=False)["label"].tolist()
+    return labs, [l.lower() for l in labs]
+
+
+def search_movies(term, limit=8):
+    """Titles starting with the text first, then titles containing it."""
+    labs, lows = search_index(movies)
+    t = term.strip().lower()
+    starts, has = [], []
+    for lab, low in zip(labs, lows):
+        if low.startswith(t):
+            starts.append(lab)
+        elif t in low:
+            has.append(lab)
+    return (starts + has)[:limit]
+
+
+def choose(label):
+    st.session_state["pick"] = label
+    st.session_state["q"] = ""
+
+
 def surprise():
-    st.session_state["pick"] = random.choice(labels[:5000])
+    st.session_state["pick"] = random.choice(labels)
+    st.session_state["q"] = ""
 
 
 with st.sidebar:
     st.markdown('<div class="brand">CineMind-AI</div>', unsafe_allow_html=True)
-    st.selectbox("Pick a movie you like", labels, key="pick")
-    st.button("Surprise me", on_click=surprise, use_container_width=True)
+    pick = st.session_state["pick"]
+    options = labels if pick in labels else [pick] + labels
+    # Type in the box to filter the list. It holds the best-known movies, so it stays fast.
+    st.session_state["pick"] = st.selectbox("Pick a movie you like", options, index=options.index(pick))
+    st.button("Surprise me", on_click=surprise, use_container_width=True, type="primary")
+
+    q = st.session_state.get("q", "").strip()
+    with st.expander("Can't find it? Search all movies", expanded=bool(q)):
+        q = st.text_input("Movie name", key="q", placeholder="Type a name, press Enter",
+                          label_visibility="collapsed").strip()
+        if q:
+            found = search_movies(q)
+            for i, lab in enumerate(found):
+                st.button(lab, key=f"found_{i}", on_click=choose, args=(lab,), use_container_width=True)
+            if not found:
+                st.caption("No movie found. Try fewer letters.")
     st.divider()
     n = st.slider("How many recommendations", 4, 24, 12, step=4)
     min_rating = st.slider("Minimum rating", 0.0, 9.0, 0.0, step=0.5)
